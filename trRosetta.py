@@ -1,51 +1,71 @@
 #!/usr/bin/env python
+"""
+a single script for folding proteins with trRosetta + pyrosetta
+if you publish a model made by this please cite:
+J Yang et al, Improved protein structure prediction using predicted inter-residue orientations, PNAS (2020).
+"""
 
-import sys
+import copy
 import os
-import json
-import tempfile
+import pathlib
 import numpy as np
 import random
+from typing import Dict, Any
 
-from pyrosetta import *
+from pyrosetta import (
+    rosetta,
+    MoveMap,
+    SwitchResidueTypeSetMover,
+    ScoreFunction,
+    init,
+    create_score_function,
+    RepeatMover,
+    pose_from_sequence,
+)
 from pyrosetta.rosetta.protocols.minimization_packing import MinMover
 import argparse
 
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+# These are program defaults
+PARAMS = {
+    "PCUT": 0.05,
+    "PCUT1": 0.5,
+    "EBASE": -0.5,
+    "EREP": [10.0, 3.0, 0.5],
+    "DREP": [0.0, 2.0, 3.5],
+    "PREP": 0.1,
+    "SIGD": 10.0,
+    "SIGM": 1.0,
+    "MEFF": 0.0001,
+    "DCUT": 19.5,
+    "ALPHA": 1.57,
+    "DSTEP": 0.5,
+    "ASTEP": 15.0,
+}
 
 
-def get_args(params):
-
+def parseargs():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("NPZ", type=str, help="input distograms and anglegrams (NN predictions)")
-    parser.add_argument("FASTA", type=str, help="input sequence")
-    parser.add_argument("OUT", type=str, help="output model (in PDB format)")
+    parser.add_argument("--npz", type=str, help="input distograms and anglegrams (NN predictions)", required=True)
+    parser.add_argument("--fasta", type=str, help="input sequence as a fasta file", required=True)
+    parser.add_argument("--output_pdb", type=str, help="output model (in PDB format)", required=True)
+    parser.add_argument("--weights_dir", help="Directory containing scorefunction definitions", required=True)
 
     parser.add_argument(
-        "-pd", type=float, dest="pcut", default=params["PCUT"], help="min probability of distance restraints"
+        "-p", "--pcut", type=float, default=PARAMS["PCUT"], help="min probability of distance restraints"
     )
     parser.add_argument(
-        "-m", type=int, dest="mode", default=2, choices=[0, 1, 2], help="0: sh+m+l, 1: (sh+m)+l, 2: (sh+m+l)"
+        "-m", "--mode", type=int, default=2, choices=[0, 1, 2], help="0: sh+m+l, 1: (sh+m)+l, 2: (sh+m+l)"
     )
-    parser.add_argument("-w", type=str, dest="wdir", default=params["WDIR"], help="folder to store temp files")
+    parser.add_argument("--workdir", type=str, default="workdir", help="folder to store temp files")
     parser.add_argument("-n", type=int, dest="steps", default=1000, help="number of minimization steps")
-    parser.add_argument("--orient", dest="use_orient", action="store_true", help="use orientations")
-    parser.add_argument("--no-orient", dest="use_orient", action="store_false")
-    parser.add_argument("--fastrelax", dest="fastrelax", action="store_true", help="perform FastRelax")
-    parser.add_argument("--no-fastrelax", dest="fastrelax", action="store_false")
-    parser.set_defaults(use_orient=True)
-    parser.set_defaults(fastrelax=True)
-
+    parser.add_argument("--no-orient", dest="use_orient", action="store_false", default=True)
+    parser.add_argument("--no-fastrelax", dest="fastrelax", action="store_false", default=True)
     args = parser.parse_args()
-
-    params["PCUT"] = args.pcut
-    params["USE_ORIENT"] = args.use_orient
-
     return args
 
 
-def gen_rst(npz, tmpdir, params):
-
+def gen_rst(npz: Dict[str, Any], tmpdir: str, params: Dict[str, Any]) -> Dict[str, Any]:
     dist, omega, theta, phi = npz["dist"], npz["omega"], npz["theta"], npz["phi"]
 
     # dictionary to store Rosetta restraints
@@ -55,37 +75,15 @@ def gen_rst(npz, tmpdir, params):
     # assign parameters
     ########################################################
     PCUT = 0.05  # params['PCUT']
-    PCUT1 = params["PCUT1"]
     EBASE = params["EBASE"]
     EREP = params["EREP"]
     DREP = params["DREP"]
-    PREP = params["PREP"]
-    SIGD = params["SIGD"]
-    SIGM = params["SIGM"]
     MEFF = params["MEFF"]
     DCUT = params["DCUT"]
     ALPHA = params["ALPHA"]
 
     DSTEP = params["DSTEP"]
     ASTEP = np.deg2rad(params["ASTEP"])
-
-    seq = params["seq"]
-
-    ########################################################
-    # repultion restraints
-    ########################################################
-    # cbs = ['CA' if a=='G' else 'CB' for a in params['seq']]
-    """
-    prob = np.sum(dist[:,:,5:], axis=-1)
-    i,j = np.where(prob<PREP)
-    prob = prob[i,j]
-    for a,b,p in zip(i,j,prob):
-        if b>a:
-            name=tmpdir.name+"/%d.%d_rep.txt"%(a+1,b+1)
-            rst_line = 'AtomPair %s %d %s %d SCALARWEIGHTEDFUNC %.2f SUMFUNC 2 CONSTANTFUNC 0.5 SIGMOID %.3f %.3f\n'%('CB',a+1,'CB',b+1,-0.5,SIGD,SIGM)
-            rst['rep'].append([a,b,p,rst_line])
-    print("rep restraints:   %d"%(len(rst['rep'])))
-    """
 
     ########################################################
     # dist: 0..20A
@@ -98,26 +96,36 @@ def gen_rst(npz, tmpdir, params):
     repul = np.maximum(attr[:, :, 0], np.zeros((nres, nres)))[:, :, None] + np.array(EREP)[None, None, :]
     dist = np.concatenate([repul, attr], axis=-1)
     bins = np.concatenate([DREP, bins])
+    rosetta_spline_bins = rosetta.utility.vector1_double()
+    for bin_ in bins:
+        rosetta_spline_bins.append(bin_)
     i, j = np.where(prob > PCUT)
     prob = prob[i, j]
     nbins = 35
     step = 0.5
     for a, b, p in zip(i, j, prob):
         if b > a:
-            name = tmpdir.name + "/%d.%d.txt" % (a + 1, b + 1)
-            with open(name, "w") as f:
-                f.write("x_axis" + "\t%.3f" * nbins % tuple(bins) + "\n")
-                f.write("y_axis" + "\t%.3f" * nbins % tuple(dist[a, b]) + "\n")
-                f.close()
-            rst_line = "AtomPair %s %d %s %d SPLINE TAG %s 1.0 %.3f %.5f" % ("CB", a + 1, "CB", b + 1, name, 1.0, step)
-            rst["dist"].append([a, b, p, rst_line])
-    print("dist restraints:  %d" % (len(rst["dist"])))
+            rosetta_spline_potential = rosetta.utility.vector1_double()
+            for pot in dist[a, b]:
+                rosetta_spline_potential.append(pot)
+            spline = rosetta.core.scoring.func.SplineFunc(
+                "", 1.0, 0.0, step, rosetta_spline_bins, rosetta_spline_potential
+            )
+            atom_id_a = rosetta.core.id.AtomID(5, a + 1)
+            atom_id_b = rosetta.core.id.AtomID(5, b + 1)  # 5 is CB
+            rst["dist"].append(
+                [a, b, p, rosetta.core.scoring.constraints.AtomPairConstraint(atom_id_a, atom_id_b, spline)]
+            )
+    print(f"dist restraints: {len(rst['dist'])}")
 
     ########################################################
     # omega: -pi..pi
     ########################################################
     nbins = omega.shape[2] - 1 + 4
     bins = np.linspace(-np.pi - 1.5 * ASTEP, np.pi + 1.5 * ASTEP, nbins)
+    rosetta_spline_bins = rosetta.utility.vector1_double()
+    for bin_ in bins:
+        rosetta_spline_bins.append(bin_)
     prob = np.sum(omega[:, :, 1:], axis=-1)
     i, j = np.where(prob > PCUT)
     prob = prob[i, j]
@@ -125,26 +133,26 @@ def gen_rst(npz, tmpdir, params):
     omega = np.concatenate([omega[:, :, -2:], omega[:, :, 1:], omega[:, :, 1:3]], axis=-1)
     for a, b, p in zip(i, j, prob):
         if b > a:
-            name = tmpdir.name + "/%d.%d_omega.txt" % (a + 1, b + 1)
-            with open(name, "w") as f:
-                f.write("x_axis" + "\t%.5f" * nbins % tuple(bins) + "\n")
-                f.write("y_axis" + "\t%.5f" * nbins % tuple(omega[a, b]) + "\n")
-                f.close()
-            rst_line = "Dihedral CA %d CB %d CB %d CA %d SPLINE TAG %s 1.0 %.3f %.5f" % (
-                a + 1,
-                a + 1,
-                b + 1,
-                b + 1,
-                name,
-                1.0,
-                ASTEP,
+            rosetta_spline_potential = rosetta.utility.vector1_double()
+            for pot in omega[a, b]:
+                rosetta_spline_potential.append(pot)
+            spline = rosetta.core.scoring.func.SplineFunc(
+                "", 1.0, 0.0, ASTEP, rosetta_spline_bins, rosetta_spline_potential
             )
-            rst["omega"].append([a, b, p, rst_line])
-    print("omega restraints: %d" % (len(rst["omega"])))
+            atom_id_1 = rosetta.core.id.AtomID(2, a + 1)  # CA
+            atom_id_2 = rosetta.core.id.AtomID(5, a + 1)  # CB
+            atom_id_3 = rosetta.core.id.AtomID(5, b + 1)
+            atom_id_4 = rosetta.core.id.AtomID(2, b + 1)
+            constraint = rosetta.core.scoring.constraints.DihedralConstraint(
+                atom_id_1, atom_id_2, atom_id_3, atom_id_4, spline
+            )
+            rst["omega"].append([a, b, p, constraint])
+    print(f"omega restraints: {len(rst['omega'])}")
 
     ########################################################
     # theta: -pi..pi
     ########################################################
+    # use bins from omega
     prob = np.sum(theta[:, :, 1:], axis=-1)
     i, j = np.where(prob > PCUT)
     prob = prob[i, j]
@@ -152,31 +160,31 @@ def gen_rst(npz, tmpdir, params):
     theta = np.concatenate([theta[:, :, -2:], theta[:, :, 1:], theta[:, :, 1:3]], axis=-1)
     for a, b, p in zip(i, j, prob):
         if b != a:
-            name = tmpdir.name + "/%d.%d_theta.txt" % (a + 1, b + 1)
-            with open(name, "w") as f:
-                f.write("x_axis" + "\t%.3f" * nbins % tuple(bins) + "\n")
-                f.write("y_axis" + "\t%.3f" * nbins % tuple(theta[a, b]) + "\n")
-                f.close()
-            rst_line = "Dihedral N %d CA %d CB %d CB %d SPLINE TAG %s 1.0 %.3f %.5f" % (
-                a + 1,
-                a + 1,
-                a + 1,
-                b + 1,
-                name,
-                1.0,
-                ASTEP,
+            rosetta_spline_potential = rosetta.utility.vector1_double()
+            for pot in theta[a, b]:
+                rosetta_spline_potential.append(pot)
+
+            spline = rosetta.core.scoring.func.SplineFunc(
+                "", 1.0, 0.0, ASTEP, rosetta_spline_bins, rosetta_spline_potential
             )
-            rst["theta"].append([a, b, p, rst_line])
-            # if a==0 and b==9:
-            #    with open(name,'r') as f:
-            #        print(f.read())
-    print("theta restraints: %d" % (len(rst["theta"])))
+            atom_id_1 = rosetta.core.id.AtomID(1, a + 1)  # N
+            atom_id_2 = rosetta.core.id.AtomID(2, a + 1)  # CA
+            atom_id_3 = rosetta.core.id.AtomID(5, a + 1)  # CB
+            atom_id_4 = rosetta.core.id.AtomID(5, b + 1)
+            constraint = rosetta.core.scoring.constraints.DihedralConstraint(
+                atom_id_1, atom_id_2, atom_id_3, atom_id_4, spline
+            )
+            rst["theta"].append([a, b, p, constraint])
+    print(f"theta restraints: {len(rst['theta'])}")
 
     ########################################################
     # phi: 0..pi
     ########################################################
     nbins = phi.shape[2] - 1 + 4
     bins = np.linspace(-1.5 * ASTEP, np.pi + 1.5 * ASTEP, nbins)
+    rosetta_spline_bins = rosetta.utility.vector1_double()
+    for bin_ in bins:
+        rosetta_spline_bins.append(bin_)
     prob = np.sum(phi[:, :, 1:], axis=-1)
     i, j = np.where(prob > PCUT)
     prob = prob[i, j]
@@ -184,19 +192,19 @@ def gen_rst(npz, tmpdir, params):
     phi = np.concatenate([np.flip(phi[:, :, 1:3], axis=-1), phi[:, :, 1:], np.flip(phi[:, :, -2:], axis=-1)], axis=-1)
     for a, b, p in zip(i, j, prob):
         if b != a:
-            name = tmpdir.name + "/%d.%d_phi.txt" % (a + 1, b + 1)
-            with open(name, "w") as f:
-                f.write("x_axis" + "\t%.3f" * nbins % tuple(bins) + "\n")
-                f.write("y_axis" + "\t%.3f" * nbins % tuple(phi[a, b]) + "\n")
-                f.close()
-            rst_line = "Angle CA %d CB %d CB %d SPLINE TAG %s 1.0 %.3f %.5f" % (a + 1, a + 1, b + 1, name, 1.0, ASTEP)
-            rst["phi"].append([a, b, p, rst_line])
-            # if a==0 and b==9:
-            #    with open(name,'r') as f:
-            #        print(f.read())
+            rosetta_spline_potential = rosetta.utility.vector1_double()
+            for pot in phi[a, b]:
+                rosetta_spline_potential.append(pot)
+            spline = rosetta.core.scoring.func.SplineFunc(
+                "", 1.0, 0.0, ASTEP, rosetta_spline_bins, rosetta_spline_potential
+            )
+            atom_id_1 = rosetta.core.id.AtomID(2, a + 1)  # CA
+            atom_id_2 = rosetta.core.id.AtomID(5, a + 1)  # CB
+            atom_id_3 = rosetta.core.id.AtomID(5, b + 1)
+            constraint = rosetta.core.scoring.constraints.AngleConstraint(atom_id_1, atom_id_2, atom_id_3, spline)
+            rst["phi"].append([a, b, p, constraint])
 
-    print("phi restraints:   %d" % (len(rst["phi"])))
-
+    print(f"phi restraints: {len(rst['phi'])}")
     return rst
 
 
@@ -207,7 +215,6 @@ def set_random_dihedral(pose):
         pose.set_phi(i, phi)
         pose.set_psi(i, psi)
         pose.set_omega(i, 180)
-
     return pose
 
 
@@ -243,14 +250,14 @@ def random_dihedral():
     return (phi, psi)
 
 
-def read_fasta(file):
+def read_fasta(filename: str):
     fasta = ""
-    with open(file, "r") as f:
-        for line in f:
+    with open(filename) as fh:
+        for line in fh:
             if line[0] == ">":
                 continue
             else:
-                line = line.rstrip()
+                line = line.strip()
                 fasta = fasta + line
     return fasta
 
@@ -262,46 +269,56 @@ def remove_clash(scorefxn, mover, pose):
         mover.apply(pose)
 
 
-def add_rst(pose, rst, sep1, sep2, params, nogly=False):
+def add_rst(pose, rst: Dict[str, Any], sep1: int, sep2: int, params: Dict[str, Any], nogly: bool = False) -> None:
 
     pcut = params["PCUT"]
     seq = params["seq"]
 
     array = []
 
-    if nogly == True:
+    if nogly:
         array += [
-            line
-            for a, b, p, line in rst["dist"]
+            rosetta_cst
+            for a, b, p, rosetta_cst in rst["dist"]
             if abs(a - b) >= sep1 and abs(a - b) < sep2 and seq[a] != "G" and seq[b] != "G" and p >= pcut
         ]
-        if params["USE_ORIENT"] == True:
+        if params["USE_ORIENT"]:
             array += [
-                line
-                for a, b, p, line in rst["omega"]
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["omega"]
                 if abs(a - b) >= sep1 and abs(a - b) < sep2 and seq[a] != "G" and seq[b] != "G" and p >= pcut + 0.5
             ]  # 0.5
             array += [
-                line
-                for a, b, p, line in rst["theta"]
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["theta"]
                 if abs(a - b) >= sep1 and abs(a - b) < sep2 and seq[a] != "G" and seq[b] != "G" and p >= pcut + 0.5
             ]  # 0.5
             array += [
-                line
-                for a, b, p, line in rst["phi"]
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["phi"]
                 if abs(a - b) >= sep1 and abs(a - b) < sep2 and seq[a] != "G" and seq[b] != "G" and p >= pcut + 0.6
             ]  # 0.6
     else:
-        array += [line for a, b, p, line in rst["dist"] if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut]
-        if params["USE_ORIENT"] == True:
+        array += [
+            rosetta_cst
+            for a, b, p, rosetta_cst in rst["dist"]
+            if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut
+        ]
+        if params["USE_ORIENT"]:
             array += [
-                line for a, b, p, line in rst["omega"] if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.5
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["omega"]
+                if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.5
             ]
             array += [
-                line for a, b, p, line in rst["theta"] if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.5
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["theta"]
+                if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.5
             ]
             array += [
-                line for a, b, p, line in rst["phi"] if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.6
+                rosetta_cst
+                for a, b, p, rosetta_cst in rst["phi"]
+                if abs(a - b) >= sep1 and abs(a - b) < sep2 and p >= pcut + 0.6
             ]  # 0.6
 
     if len(array) < 1:
@@ -309,67 +326,52 @@ def add_rst(pose, rst, sep1, sep2, params, nogly=False):
 
     random.shuffle(array)
 
-    # save to file
-    tmpname = params["TDIR"] + "/minimize.cst"
-    with open(tmpname, "w") as f:
-        for line in array:
-            f.write(line + "\n")
-        f.close()
+    constraints = rosetta.core.scoring.constraints.ConstraintSet()
+    for constraint in array:
+        constraints.add_constraints(constraint)
 
     # add to pose
-    constraints = rosetta.protocols.constraint_movers.ConstraintSetMover()
-    constraints.constraint_file(tmpname)
-    constraints.add_constraints(True)
-    constraints.apply(pose)
-
-    os.remove(tmpname)
+    csm = rosetta.protocols.constraint_movers.ConstraintSetMover()
+    csm.constraint_set(constraints)
+    csm.add_constraints(True)
+    csm.apply(pose)
 
 
-def main():
-
-    ########################################################
-    # process inputs
-    ########################################################
-
-    # read params
-    scriptdir = os.path.dirname(os.path.realpath(__file__))
-    with open(scriptdir + "/data/params.json") as jsonfile:
-        params = json.load(jsonfile)
-
-    # get command line arguments
-    args = get_args(params)
-    print(args)
+def main(args):
+    params = copy.deepcopy(PARAMS)
+    params["USE_ORIENT"] = args.use_orient
+    params["PCUT"] = args.pcut
+    workdir = args.workdir
 
     # init PyRosetta
     init("-hb_cen_soft -relax:default_repeats 5 -default_max_cycles 200 -out:level 100")
 
     # Create temp folder to store all the restraints
-    tmpdir = tempfile.TemporaryDirectory(prefix=args.wdir + "/")
-    params["TDIR"] = tmpdir.name
-    print("temp folder:     ", tmpdir.name)
+    pathlib.Path(workdir).mkdir(exist_ok=True, parents=True)
 
     # read and process restraints & sequence
-    npz = np.load(args.NPZ)
-    seq = read_fasta(args.FASTA)
-    L = len(seq)
-    params["seq"] = seq
-    rst = gen_rst(npz, tmpdir, params)
-    seq_polyala = "A" * len(seq)
+    npz = np.load(args.npz)
+    seq = read_fasta(args.fasta)
+    rst = gen_rst(npz, workdir, params)
 
     ########################################################
     # Scoring functions and movers
     ########################################################
     sf = ScoreFunction()
-    sf.add_weights_from_file(scriptdir + "/data/scorefxn.wts")
+    sf_base_fn = os.path.join(args.weights_dir, "data/scorefxn.wts")
+    sf.add_weights_from_file(sf_base_fn)
 
     sf1 = ScoreFunction()
-    sf1.add_weights_from_file(scriptdir + "/data/scorefxn1.wts")
+    sf_1_fn = os.path.join(args.weights_dir, "data/scorefxn1.wts")
+    sf1.add_weights_from_file(sf_1_fn)
 
     sf_vdw = ScoreFunction()
-    sf_vdw.add_weights_from_file(scriptdir + "/data/scorefxn_vdw.wts")
+    sf_vdw_fn = os.path.join(args.weights_dir, "data/scorefxn_vdw.wts")
+    sf_vdw.add_weights_from_file(sf_vdw_fn)
 
     sf_cart = ScoreFunction()
-    sf_cart.add_weights_from_file(scriptdir + "/data/scorefxn_cart.wts")
+    sf_cart_fn = os.path.join(args.weights_dir, "data/scorefxn_cart.wts")
+    sf_cart.add_weights_from_file(sf_cart_fn)
 
     mmap = MoveMap()
     mmap.set_bb(True)
@@ -401,7 +403,7 @@ def main():
         if a == "G":
             mutator = rosetta.protocols.simple_moves.MutateResidue(i + 1, "ALA")
             mutator.apply(pose)
-            print("mutation: G%dA" % (i + 1))
+            print(f"mutation: G{i+1}A")
 
     set_random_dihedral(pose)
     remove_clash(sf_vdw, min_mover_vdw, pose)
@@ -463,13 +465,14 @@ def main():
         if a == "G":
             mutator = rosetta.protocols.simple_moves.MutateResidue(i + 1, "GLY")
             mutator.apply(pose)
-            print("mutation: A%dG" % (i + 1))
+            print(f"mutation: G{i+1}A")
 
     ########################################################
     # full-atom refinement
     ########################################################
 
-    if args.fastrelax == True:
+    if args.fastrelax:
+        print("running fast relax")
 
         sf_fa = create_score_function("ref2015")
         sf_fa.set_weight(rosetta.core.scoring.atom_pair_constraint, 5)
@@ -499,8 +502,8 @@ def main():
     ########################################################
     # save final model
     ########################################################
-    pose.dump_pdb(args.OUT)
+    pose.dump_pdb(args.output_pdb)
 
 
 if __name__ == "__main__":
-    main()
+    main(parseargs())
