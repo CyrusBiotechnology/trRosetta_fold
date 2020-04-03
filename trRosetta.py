@@ -359,19 +359,19 @@ def main(args):
     # Scoring functions and movers
     ########################################################
     sf = ScoreFunction()
-    sf_base_fn = os.path.join(args.weights_dir, "data/scorefxn.wts")
+    sf_base_fn = os.path.join(args.weights_dir, "scorefxn.wts")
     sf.add_weights_from_file(sf_base_fn)
 
     sf1 = ScoreFunction()
-    sf_1_fn = os.path.join(args.weights_dir, "data/scorefxn1.wts")
+    sf_1_fn = os.path.join(args.weights_dir, "scorefxn1.wts")
     sf1.add_weights_from_file(sf_1_fn)
 
     sf_vdw = ScoreFunction()
-    sf_vdw_fn = os.path.join(args.weights_dir, "data/scorefxn_vdw.wts")
+    sf_vdw_fn = os.path.join(args.weights_dir, "scorefxn_vdw.wts")
     sf_vdw.add_weights_from_file(sf_vdw_fn)
 
     sf_cart = ScoreFunction()
-    sf_cart_fn = os.path.join(args.weights_dir, "data/scorefxn_cart.wts")
+    sf_cart_fn = os.path.join(args.weights_dir, "scorefxn_cart.wts")
     sf_cart.add_weights_from_file(sf_cart_fn)
 
     mmap = MoveMap()
