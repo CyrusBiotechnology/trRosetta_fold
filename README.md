@@ -27,8 +27,8 @@ typically you would run in this fashion
 for mode in range(3):
    for p in [0.05, 0.15, 0.25, 0.35, 0.45]:
        for model_id in range(10):
-           python trRosetta.py --npz T1008.npz --fasta T1008.fasta --output_pdb model_$mode_$p_$model_id.pdb --weights_dir ../data
-{collect pdbs with top score}
+           python trRosetta.py --npz T1008.npz --fasta T1008.fasta --output_pdb model_$mode_$p_$model_id.pdb --weights_dir ../data --mode $mode --pcut $p
+{collect pdbs with best score}
 ```
 More details about trRosetta can be found from the following paper:
 J Yang et al, Improved protein structure prediction using predicted inter-residue orientations, PNAS (2020).
