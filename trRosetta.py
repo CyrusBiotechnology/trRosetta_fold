@@ -328,7 +328,7 @@ def add_rst(pose, rst: Dict[str, Any], sep1: int, sep2: int, params: Dict[str, A
 
     constraints = rosetta.core.scoring.constraints.ConstraintSet()
     for constraint in array:
-        constraints.add_constraints(constraint)
+        constraints.add_constraint(constraint)
 
     # add to pose
     csm = rosetta.protocols.constraint_movers.ConstraintSetMover()
