@@ -353,6 +353,7 @@ def main(args):
     npz = np.load(args.npz)
     seq = read_fasta(args.fasta)
     rst = gen_rst(npz, workdir, params)
+    params["seq"] = seq
 
     ########################################################
     # Scoring functions and movers
